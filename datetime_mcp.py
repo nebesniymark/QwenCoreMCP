@@ -9,7 +9,7 @@ from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 SERVER_NAME = "datetime-calendar"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.2.1"
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 MODERN_PROTOCOL = "2026-07-28"
@@ -225,7 +225,7 @@ def run_tool(args):
             "direction": "end_after_start" if seconds > 0 else "end_before_start" if seconds < 0 else "same_instant",
         }
 
-    raise ValueError("Unknown action. Use now, calendar, weekday, add, or difference")
+    raise ValueError("Unknown action. Use now, calendar, weekday, add, difference, convert, timestamp, or localize")
 
 
 def send(message):
@@ -265,8 +265,9 @@ def _legacy_handle(req):
     if not has_id:
         return None
     if method == "initialize":
+        params = req.get("params") or {}
         return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": req.get("params", {}).get("protocolVersion") if req.get("params", {}).get("protocolVersion") in SUPPORTED_PROTOCOLS else PROTOCOL_VERSION,
+            "protocolVersion": params.get("protocolVersion") if params.get("protocolVersion") in SUPPORTED_PROTOCOLS else PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }}
@@ -277,7 +278,7 @@ def _legacy_handle(req):
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["now", "calendar", "weekday", "add", "difference", "convert", "timestamp", "localize"]},
-                "timezone": {"type": "string", "description": "IANA name (Europe/Moscow), city (Moscow) or offset (UTC+3); default UTC; used by now"},
+                "timezone": {"type": "string", "description": "IANA zone/city/UTC offset; used by now, add, convert, localize and timestamp; required for convert/localize"},
                 "year": {"type": "integer", "minimum": 1, "maximum": 9999},
                 "month": {"type": "integer", "minimum": 1, "maximum": 12},
                 "date": {"type": "string", "description": "Date in YYYY-MM-DD format; used by weekday"},
@@ -304,6 +305,8 @@ def _legacy_handle(req):
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "Unknown tool or invalid parameters"}}
         try:
             arguments = params.get("arguments")
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
             result = run_tool({} if arguments is None else arguments)
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}], "isError": False}}
         except Exception as exc:
@@ -324,14 +327,16 @@ def handle(request):
         if version != MODERN_PROTOCOL:
             if method == "server/discover" and version is None:
                 return rpc_error(request.get("id"), -32601, "Method not found")
-            return rpc_error(request.get("id"), -32022, "Unsupported protocol version: " + MODERN_PROTOCOL)
+            return {"jsonrpc": "2.0", "id": request.get("id"), "error": {
+                "code": -32022, "message": "Unsupported protocol version",
+                "data": {"supported": [MODERN_PROTOCOL, *SUPPORTED_PROTOCOLS], "requested": version}}}
         if not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
             return rpc_error(request.get("id"), -32602, "Missing clientCapabilities")
         if "id" not in request:
             return None
         if method == "server/discover":
-            result = {"supportedVersions": [MODERN_PROTOCOL],
-                      "capabilities": {"tools": {}}}
+            result = {"resultType": "complete", "supportedVersions": [MODERN_PROTOCOL],
+                      "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private"}
         elif method in ("initialize", "ping"):
             return rpc_error(request.get("id"), -32601, "Method not supported in modern MCP")
         else:
@@ -339,6 +344,10 @@ def handle(request):
             if response is None or "result" not in response:
                 return response
             result = response["result"]
+            result["resultType"] = "complete"
+            if method == "tools/list":
+                result["ttlMs"] = 0
+                result["cacheScope"] = "private"
         result["_meta"] = {"io.modelcontextprotocol/serverInfo":
                            {"name": SERVER_NAME, "version": SERVER_VERSION}}
         return {"jsonrpc": "2.0", "id": request.get("id"), "result": result}

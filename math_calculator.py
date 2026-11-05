@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP math server v3.1.1
+MCP math server v3.1.2
 
 Three evaluation backends, none of which uses eval()/exec() on user input:
   * numeric  - strict AST evaluator (ints/floats, math + finance functions)
@@ -36,16 +36,17 @@ except ImportError:  # pragma: no cover
     np = None
 
 SERVER_NAME = "math-calculator"
-SERVER_VERSION = "3.1.1"
+SERVER_VERSION = "3.1.2"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 MODERN_PROTOCOL = "2026-07-28"
 
 MAX_EXPR_LEN = 2000
 MAX_AST_NODES = 180
+MAX_MATRIX_AST_NODES = 2000  # matrix literals need more nodes than scalar expressions
 MAX_INT_BITS = 4096
 MAX_EXPONENT = 500
-MAX_FACTORIAL_ARG = 1000
+MAX_FACTORIAL_ARG = 536  # factorial(536) fits MAX_INT_BITS=4096
 MAX_ARRAY_ELEMENTS = 10_000
 MAX_PERIODS = 12_000
 MAX_RESULT_CHARS = 3500
@@ -210,7 +211,7 @@ def preprocess(expr):
     return expr.replace("^", "**")
 
 
-def parse_tree(expr):
+def parse_tree(expr, max_nodes=MAX_AST_NODES):
     if not isinstance(expr, str) or not expr.strip():
         raise ValueError("Expression must be a non-empty string")
     if len(expr) > MAX_EXPR_LEN:
@@ -219,7 +220,7 @@ def parse_tree(expr):
         tree = ast.parse(expr.strip(), mode="eval")
     except (SyntaxError, ValueError, MemoryError, RecursionError) as exc:
         raise ValueError("Invalid expression syntax") from exc
-    if sum(1 for _ in ast.walk(tree)) > MAX_AST_NODES:
+    if sum(1 for _ in ast.walk(tree)) > max_nodes:
         raise ValueError("Expression is too complex")
     return tree
 
@@ -636,7 +637,7 @@ def matrix_calculate(expr):
         raise RuntimeError("NumPy is not installed (pip install numpy)")
     try:
         with np.errstate(all="raise"):
-            res = mat_eval(parse_tree(expr), mat_funcs())
+            res = mat_eval(parse_tree(expr, max_nodes=MAX_MATRIX_AST_NODES), mat_funcs())
             if isinstance(res, tuple):
                 raise ValueError("Result must be a number or a matrix")
             arr = np.asarray(res)
@@ -803,7 +804,8 @@ SYMBOLIC_ONLY = {"solve", "diff", "integrate", "simplify", "factor", "expand", "
 def detect_mode(expr):
     if split_equation(expr) is not None:
         return "symbolic"
-    tree = parse_tree(expr)
+    # Allow larger literals during dispatch; other modes keep the strict AST cap.
+    tree = parse_tree(expr, max_nodes=MAX_MATRIX_AST_NODES)
     called, has_var, has_matrix_syntax = set(), False, False
     for n in ast.walk(tree):
         if isinstance(n, ast.List) or (isinstance(n, ast.BinOp) and isinstance(n.op, ast.MatMult)):
@@ -927,8 +929,13 @@ def _legacy_handle(request):
         if params.get("name") != "calculate":
             return rpc_error(mid, -32602, "Unknown tool name")
         args = params.get("arguments")
-        args = args if isinstance(args, dict) else {}
         try:
+            if isinstance(args, str):
+                args = json.loads(args)
+            if args is None:
+                args = {}
+            if not isinstance(args, dict):
+                raise ValueError("arguments must be an object")
             text, is_error = calculate(args.get("expr"), args.get("mode", "auto")), False
         except Exception as exc:  # noqa: BLE001 - reported to the model as a tool error
             text, is_error = f"Calculation error: {exc}", True
@@ -951,14 +958,16 @@ def handle(request):
         if version != MODERN_PROTOCOL:
             if method == "server/discover" and version is None:
                 return rpc_error(request.get("id"), -32601, "Method not found")
-            return rpc_error(request.get("id"), -32022, "Unsupported protocol version: " + MODERN_PROTOCOL)
+            return {"jsonrpc": "2.0", "id": request.get("id"), "error": {
+                "code": -32022, "message": "Unsupported protocol version",
+                "data": {"supported": [MODERN_PROTOCOL, *SUPPORTED_PROTOCOLS], "requested": version}}}
         if not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
             return rpc_error(request.get("id"), -32602, "Missing clientCapabilities")
         if "id" not in request:
             return None
         if method == "server/discover":
-            result = {"supportedVersions": [MODERN_PROTOCOL],
-                      "capabilities": {"tools": {}}}
+            result = {"resultType": "complete", "supportedVersions": [MODERN_PROTOCOL],
+                      "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private"}
         elif method in ("initialize", "ping"):
             return rpc_error(request.get("id"), -32601, "Method not supported in modern MCP")
         else:
@@ -966,6 +975,10 @@ def handle(request):
             if response is None or "result" not in response:
                 return response
             result = response["result"]
+            result["resultType"] = "complete"
+            if method == "tools/list":
+                result["ttlMs"] = 0
+                result["cacheScope"] = "private"
         result["_meta"] = {"io.modelcontextprotocol/serverInfo":
                            {"name": SERVER_NAME, "version": SERVER_VERSION}}
         return {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
