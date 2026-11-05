@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP math server v3.0.0
+MCP math server v3.1.1
 
 Three evaluation backends, none of which uses eval()/exec() on user input:
   * numeric  - strict AST evaluator (ints/floats, math + finance functions)
@@ -20,7 +20,10 @@ import json
 import math
 import operator
 import sys
+import os
+import subprocess
 import threading
+import atexit
 
 try:
     import sympy as sp
@@ -33,9 +36,10 @@ except ImportError:  # pragma: no cover
     np = None
 
 SERVER_NAME = "math-calculator"
-SERVER_VERSION = "3.0.0"
-SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+SERVER_VERSION = "3.1.1"
+SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
+MODERN_PROTOCOL = "2026-07-28"
 
 MAX_EXPR_LEN = 2000
 MAX_AST_NODES = 180
@@ -44,6 +48,8 @@ MAX_EXPONENT = 500
 MAX_FACTORIAL_ARG = 1000
 MAX_ARRAY_ELEMENTS = 10_000
 MAX_PERIODS = 12_000
+MAX_RESULT_CHARS = 3500
+MAX_RPC_BYTES = 65536
 HEAVY_TIMEOUT = 10.0  # seconds, symbolic and matrix modes
 
 MODES = ("auto", "numeric", "symbolic", "matrix")
@@ -61,7 +67,7 @@ def check_rate(rate, name="rate"):
 
 
 def check_nper(nper):
-    if not 0 < nper <= MAX_PERIODS:
+    if type(nper) not in (int, float) or not math.isfinite(nper) or not 0 < nper <= MAX_PERIODS:
         raise ValueError(f"nper must be between 0 and {MAX_PERIODS}")
     return nper
 
@@ -80,7 +86,10 @@ def pmt(rate, nper, pv):
     r, n = check_rate(rate), check_nper(nper)
     if r == 0:
         return pv / n
-    return pv * r / (1 - (1 + r) ** -n)
+    x = -n * math.log1p(r)
+    if x > 700:  # limit: negative rates near -100% over many periods
+        return 0.0
+    return pv * r / -math.expm1(x)
 
 
 def fv(rate, nper, pmt_val, pv=0):
@@ -99,6 +108,8 @@ def fv_growing_rent(invest_rate, nper, pmt_mortgage, rent_start, rent_growth_ann
     r = check_rate(invest_rate, "invest_rate")
     check_rate(rent_growth_annual, "rent_growth_annual")
     n = check_nper(nper)
+    if type(n) not in (int, float) or not float(n).is_integer():
+        raise ValueError("nper must be a whole number of months")
     balance = 0.0
     rent = float(rent_start)
     for month in range(1, int(n) + 1):
@@ -248,27 +259,32 @@ def unknown_function(name, available):
     if target is None:
         close = difflib.get_close_matches(name, list(available), n=1, cutoff=0.6)
         target = close[0] if close else None
+    if target not in available:
+        target = None
     if target:
         hint = f" Did you mean '{target}'?"
     return ValueError(f"Unknown function '{name}'.{hint}")
 
 
-def numeric_eval(node):
+def numeric_eval(node, variables=None):
+    variables = variables or {}
     if isinstance(node, ast.Expression):
-        return numeric_eval(node.body)
+        return numeric_eval(node.body, variables)
     if isinstance(node, ast.Constant) and type(node.value) in (int, float):
         return checked(node.value)
     if isinstance(node, ast.Name):
+        if node.id in variables:
+            return checked(variables[node.id])
         if node.id in CONSTS:
             return CONSTS[node.id]
-        raise ValueError(f"Unknown name '{node.id}'. Variables need symbolic mode (x, y, z, t)")
+        raise ValueError(f"Unknown name '{node.id}'. Use assignments on separate lines.")
     if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
             and node.value.id == "math" and node.attr in CONSTS):
         return CONSTS[node.attr]
     if isinstance(node, ast.UnaryOp) and type(node.op) in UOPS:
-        return checked(UOPS[type(node.op)](numeric_eval(node.operand)))
+        return checked(UOPS[type(node.op)](numeric_eval(node.operand, variables)))
     if isinstance(node, ast.BinOp) and type(node.op) in OPS:
-        a, b = numeric_eval(node.left), numeric_eval(node.right)
+        a, b = numeric_eval(node.left, variables), numeric_eval(node.right, variables)
         if type(node.op) is ast.Pow:
             if abs(b) > MAX_EXPONENT:
                 raise ValueError(f"Exponent too large (max allowed exponent is {MAX_EXPONENT})")
@@ -285,12 +301,14 @@ def numeric_eval(node):
         fn = NUMERIC_FUNCS.get(name)
         if fn is None:
             raise unknown_function(name, NUMERIC_FUNCS)
-        args = [numeric_eval(arg) for arg in node.args]
+        if len(node.args) > 80:
+            raise ValueError("Too many function arguments (max 80)")
+        args = [numeric_eval(arg, variables) for arg in node.args]
         kwargs = {}
         for kw in node.keywords:
             if name != "fv" or kw.arg != "pv":
                 raise ValueError("Keyword arguments are only allowed for fv(..., pv=...)")
-            kwargs[kw.arg] = numeric_eval(kw.value)
+            kwargs[kw.arg] = numeric_eval(kw.value, variables)
         try:
             return checked(fn(*args, **kwargs))
         except Exception as exc:
@@ -440,6 +458,8 @@ def _arr(v):
     a = a.astype(float)
     if a.size > MAX_ARRAY_ELEMENTS:
         raise ValueError(f"Array too large (max {MAX_ARRAY_ELEMENTS} elements)")
+    if not np.all(np.isfinite(a)):
+        raise ValueError("Non-finite matrix element")
     return a
 
 
@@ -466,6 +486,8 @@ def _arange(start, stop=None, step=1.0):
     start, stop, step = float(start), float(stop), float(step)
     if step == 0:
         raise ValueError("step must not be zero")
+    if not all(map(math.isfinite, (start, stop, step))):
+        raise ValueError("Non-finite array range")
     if math.ceil((stop - start) / step) > MAX_ARRAY_ELEMENTS:
         raise ValueError(f"Array too large (max {MAX_ARRAY_ELEMENTS} elements)")
     return np.arange(start, stop, step)
@@ -485,6 +507,41 @@ def _matpow(a, n):
     return np.linalg.matrix_power(_arr(a), k)
 
 
+def _limited_product(shape):
+    if math.prod(shape) > MAX_ARRAY_ELEMENTS:
+        raise ValueError(f"Matrix operation would exceed {MAX_ARRAY_ELEMENTS} elements")
+
+
+def _broadcast_guard(a, b):
+    _limited_product(np.broadcast_shapes(a.shape, b.shape))
+
+
+def _matmul_safe(a, b):
+    a, b = _arr(a), _arr(b)
+    if a.ndim == 0 or b.ndim == 0:
+        raise ValueError("matmul requires arrays with at least one dimension")
+    va, vb = (a.ndim == 1), (b.ndim == 1)
+    sa = (1, a.shape[0]) if va else a.shape
+    sb = (b.shape[0], 1) if vb else b.shape
+    if sa[-1] != sb[-2]:
+        raise ValueError("matmul dimensions do not align")
+    batch = np.broadcast_shapes(sa[:-2], sb[:-2])
+    shape = batch + ((sa[-2],) if not va else ()) + ((sb[-1],) if not vb else ())
+    _limited_product(shape)
+    return np.matmul(a, b)
+
+
+def _dot_safe(a, b):
+    a, b = _arr(a), _arr(b)
+    if a.ndim == 0 or b.ndim == 0:
+        _broadcast_guard(a, b)
+    elif b.ndim == 1:
+        _limited_product(a.shape[:-1])
+    else:
+        _limited_product(a.shape[:-1] + b.shape[:-2] + (b.shape[-1],))
+    return np.dot(a, b)
+
+
 def mat_funcs():
     la = np.linalg
     return {
@@ -494,8 +551,8 @@ def mat_funcs():
         "eigvals": lambda x: la.eigvals(_arr(x)),
         "norm": lambda x: la.norm(_arr(x)),
         "solve": lambda a, b: la.solve(_arr(a), _arr(b)),
-        "dot": lambda a, b: np.dot(_arr(a), _arr(b)),
-        "matmul": lambda a, b: np.matmul(_arr(a), _arr(b)),
+        "dot": _dot_safe,
+        "matmul": _matmul_safe,
         "zeros": lambda s: np.zeros(_shape(s)),
         "ones": lambda s: np.ones(_shape(s)),
         "eye": _eye,
@@ -513,9 +570,12 @@ def mat_eval(node, funcs):
         return mat_eval(node.body, funcs)
     if isinstance(node, ast.Constant) and type(node.value) in (int, float):
         try:
-            return np.asarray(float(node.value))
+            result = np.asarray(float(node.value))
         except OverflowError:
             raise ValueError("Number too large") from None
+        if not np.isfinite(result).all():
+            raise ValueError("Non-finite numeric value")
+        return result
     if isinstance(node, ast.Name):
         if node.id in CONSTS:
             return np.asarray(CONSTS[node.id])
@@ -536,6 +596,8 @@ def mat_eval(node, funcs):
     if isinstance(node, ast.BinOp):
         op = type(node.op)
         a, b = _arr(mat_eval(node.left, funcs)), _arr(mat_eval(node.right, funcs))
+        if op in (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow):
+            _broadcast_guard(a, b)
         if op is ast.Add:
             r = a + b
         elif op is ast.Sub:
@@ -545,7 +607,7 @@ def mat_eval(node, funcs):
         elif op is ast.Div:
             r = a / b
         elif op is ast.MatMult:
-            r = np.matmul(a, b)
+            r = _matmul_safe(a, b)
         elif op is ast.Pow:
             if b.size and np.max(np.abs(b)) > MAX_EXPONENT:
                 raise ValueError(f"Exponent too large (max allowed exponent is {MAX_EXPONENT})")
@@ -563,6 +625,8 @@ def mat_eval(node, funcs):
         res = np.asarray(fn(*[mat_eval(a, funcs) for a in node.args]))
         if res.size > MAX_ARRAY_ELEMENTS:
             raise ValueError(f"Array too large (max {MAX_ARRAY_ELEMENTS} elements)")
+        if not np.all(np.isfinite(res)):
+            raise ValueError("Non-finite matrix result")
         return res
     raise ValueError("Expression element not allowed in matrix mode")
 
@@ -580,41 +644,152 @@ def matrix_calculate(expr):
         raise
     except Exception as exc:
         raise ValueError(f"NumPy evaluation error: {exc}") from exc
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Non-finite matrix result")
     if arr.ndim == 0:
         return format_number(arr.item())
-    return np.array2string(arr, precision=10, suppress_small=False)
+    with np.printoptions(threshold=MAX_ARRAY_ELEMENTS, linewidth=110):
+        out = np.array2string(arr, precision=10, suppress_small=False)
+    return bounded_output(out, f"matrix shape={arr.shape}")
 
 
-# ------------------------------ Heavy-task runner ----------------------------
+# --------------------- Cancelable SymPy / NumPy worker ----------------------
 
-_heavy_thread = None
+def bounded_output(text, label="result"):
+    if len(text) <= MAX_RESULT_CHARS:
+        return text
+    return (f"[TRUNCATED {label}: {len(text)} characters, showing first "
+            f"{MAX_RESULT_CHARS} chars]\n" + text[:MAX_RESULT_CHARS])
 
 
-def run_heavy(fn, timeout=None):
-    """Run fn in a daemon thread with a wall-clock timeout (best effort:
-    a runaway computation cannot be killed, but the server stays responsive
-    and refuses further heavy work until the old one ends)."""
-    global _heavy_thread
-    timeout = HEAVY_TIMEOUT if timeout is None else timeout
-    if _heavy_thread is not None and _heavy_thread.is_alive():
-        raise RuntimeError("A previous symbolic/matrix computation is still running; restart the server")
-    box = {}
+_worker_proc = None
+_worker_jobs = 0
+_worker_lock = threading.Lock()
 
-    def target():
+
+def _stop_worker():
+    global _worker_proc, _worker_jobs
+    proc = _worker_proc
+    _worker_proc = None
+    _worker_jobs = 0
+    if proc is not None:
+        if proc.poll() is None:
+            proc.kill()
         try:
-            box["value"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
-            box["error"] = exc
+            proc.communicate(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
-    th = threading.Thread(target=target, daemon=True)
-    _heavy_thread = th
-    th.start()
-    th.join(timeout)
-    if th.is_alive():
-        raise ValueError(f"Computation timed out after {timeout:g}s; simplify the expression")
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
+
+atexit.register(_stop_worker)
+
+
+def run_heavy(expr, mode, timeout=None):
+    """One persistent isolated worker. Kill/restart after timeout or 128 calls."""
+    global _worker_proc, _worker_jobs
+    limit = HEAVY_TIMEOUT if timeout is None else timeout
+    if mode not in ("symbolic", "matrix") or not isinstance(expr, str) or len(expr) > MAX_EXPR_LEN:
+        raise ValueError("Invalid worker task")
+    if not 0 < limit <= 60:
+        raise ValueError("Invalid time limit")
+    with _worker_lock:
+        if _worker_proc is None or _worker_proc.poll() is not None or _worker_jobs >= 128:
+            _stop_worker()
+            env = os.environ.copy()
+            for key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                env[key] = "1"
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            _worker_proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker-loop"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", env=env, creationflags=flags,
+                bufsize=1)
+        proc = _worker_proc
+        box = {}
+
+        def read_result():
+            try:
+                box["data"] = proc.stdout.readline()
+            except Exception as exc:
+                box["error"] = exc
+
+        try:
+            proc.stdin.write(json.dumps({"expr": expr, "mode": mode}, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+            reader = threading.Thread(target=read_result, daemon=True)
+            reader.start()
+            reader.join(limit)
+            if reader.is_alive():
+                _stop_worker()
+                raise ValueError(f"Computation timed out after {limit:g}s")
+            if "error" in box or not box.get("data"):
+                _stop_worker()
+                raise ValueError("Computation worker terminated unexpectedly")
+            obj = json.loads(box["data"])
+            _worker_jobs += 1
+        except (OSError, BrokenPipeError, ValueError, json.JSONDecodeError):
+            _stop_worker()
+            raise
+        if not isinstance(obj, dict) or not isinstance(obj.get("ok"), bool):
+            _stop_worker()
+            raise ValueError("Invalid computation worker response")
+        if not obj["ok"]:
+            raise ValueError(str(obj.get("error", "Computation failed"))[:350])
+        value = str(obj["value"])
+        return value if value.startswith("[TRUNCATED ") else bounded_output(value)
+
+
+def worker_main():
+    """Execute only whitelisted modes in a killable subprocess."""
+    if os.name != "nt":
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_CPU, (120, 121))
+            resource.setrlimit(resource.RLIMIT_AS, (1536 * 1024**2, 1536 * 1024**2))
+        except (ImportError, OSError, ValueError):
+            pass
+    for raw in sys.stdin:
+        try:
+            if len(raw) > MAX_EXPR_LEN + 150:
+                raise ValueError("Invalid expression length")
+            task = json.loads(raw)
+            expr, mode = task["expr"], task["mode"]
+            if not isinstance(expr, str) or not 0 < len(expr) <= MAX_EXPR_LEN or mode not in ("symbolic", "matrix"):
+                raise ValueError("Invalid worker task")
+            val = symbolic_calculate(expr) if mode == "symbolic" else matrix_calculate(expr)
+            result = {"ok": True, "value": val if val.startswith("[TRUNCATED ") else bounded_output(val)}
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)[:350]}
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+# ---------------------- Local numeric assignment DSL ------------------------
+
+def numeric_block(expr):
+    """A sequence of simple assignments followed by one expression.
+
+    No Python statements beyond x = expression; local variables never persist.
+    """
+    if len(expr) > MAX_EXPR_LEN:
+        raise ValueError("Expression too long")
+    try:
+        tree = ast.parse(expr, mode="exec")
+    except (SyntaxError, MemoryError, RecursionError) as exc:
+        raise ValueError("Invalid assignment syntax") from exc
+    if sum(1 for _ in ast.walk(tree)) > MAX_AST_NODES or len(tree.body) > 17:
+        raise ValueError("Too many assignments or AST nodes")
+    if len(tree.body) < 2 or not isinstance(tree.body[-1], ast.Expr):
+        raise ValueError("Put one final expression after assignments")
+    variables = {}
+    for stmt in tree.body[:-1]:
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            raise ValueError("Only one NAME = numeric expression per line is allowed")
+        name = stmt.targets[0].id
+        if (not name.isidentifier() or name.startswith("_") or len(name) > 24
+                or name in NUMERIC_FUNCS or name in CONSTS or name in ("math", "np", "sp", "sympy")):
+            raise ValueError("Invalid or reserved variable name")
+        variables[name] = checked(numeric_eval(stmt.value, variables))
+    return format_number(numeric_eval(tree.body[-1].value, variables))
 
 
 # ------------------------------- Mode dispatcher -----------------------------
@@ -661,34 +836,38 @@ def calculate(expr, mode="auto"):
     expr = preprocess(expr).strip()
     if not expr or len(expr) > MAX_EXPR_LEN:
         raise ValueError("Expression is empty or too long")
+    is_block = "\n" in expr or ";" in expr
     if mode == "auto":
-        mode = detect_mode(expr)
+        mode = "numeric" if is_block else detect_mode(expr)
+    if is_block:
+        if mode != "numeric":
+            raise ValueError("Assignments are available in numeric mode only")
+        return numeric_block(expr)
     if mode == "numeric":
         return format_number(numeric_eval(parse_tree(expr)))
-    if mode == "symbolic":
-        return run_heavy(lambda: symbolic_calculate(expr))
-    return run_heavy(lambda: matrix_calculate(expr))
+    return run_heavy(expr, mode)
 
 
 # ----------------------------------- MCP layer -------------------------------
 
 TOOL_DESCRIPTION = (
-    "Calculator (mode=auto picks numeric/symbolic/matrix). Use ^ for powers. "
-    "Numeric: + - * / // % **, sqrt sin cos tan log(natural) log10 exp floor ceil factorial gcd, pi e. "
-    "Finance: rates are DECIMAL PER PERIOD (0.01 = 1% per period), never percents; "
-    "for 12% annual with monthly payments use monthly(12). "
-    "pmt(rate,nper,pv), fv(rate,nper,pmt,pv=0), npv(rate,cf0,cf1,...), irr(cf0,cf1,...) "
-    "(returns per-period rate), fv_growing_rent(rate,nper,mortgage,rent,annual_growth). "
-    "Symbolic (variables x,y,z,t): solve(x^2-4,x), diff, integrate, limit, simplify, factor, expand; "
-    "'x^2=4' solves the equation. "
-    "Matrix: [[1,2],[3,4]] @ [[1],[0]], det, inv, eigvals, solve, transpose, trace, rank, zeros, ones, eye, "
-    "matpow. ** on matrices is elementwise."
+    "Math; auto mode; ^ means power. "
+    "Mortgage: pmt(monthly(10),60,6000000) for 10% ANNUAL, 60 months. "
+    "monthly(10)=0.10/12; do NOT use monthly(10/12) for 10% annual (divides twice). "
+    "pmt/fv/npv/irr rates are decimals PER PERIOD; pmt(rate,months,principal), "
+    "fv(rate,months,payment,pv=0), npv(rate,cf0,...), irr(cf0,...). "
+    "Assignments work inside ONE expr: P=6000000; r=monthly(10); pmt(r,60,P). "
+    "Determinant: det([[4,2],[3,5]])=14; @ means matrix multiplication, NOT determinant. "
+    "Numeric: sqrt sin cos tan log log10 exp floor ceil factorial gcd pi e pct fv_growing_rent. "
+    "Symbolic: solve(x^2-5*x+6,x), diff integrate limit simplify factor expand Eq Rational; vars x,y,z,t. "
+    "Matrix: det inv eigvals norm dot matmul zeros ones eye arange reshape transpose trace rank matpow array. "
+    "Matrix ** is elementwise."
 )
 
 TOOL_SCHEMA = {
     "type": "object",
     "properties": {
-        "expr": {"type": "string", "description": "Expression, e.g. pmt(monthly(12), 120, 8000000)"},
+        "expr": {"type": "string", "description": "Expression; 10% annual mortgage: pmt(monthly(10),60,6000000)"},
         "mode": {"type": "string", "enum": list(MODES)},
     },
     "required": ["expr"],
@@ -705,9 +884,25 @@ def rpc_error(mid, code, message):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
 
 
-def handle(request):
+def rpc_validate(request):
     if not isinstance(request, dict):
         return rpc_error(None, -32600, "Invalid Request")
+    rid = request.get("id")
+    if (request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str)
+            or not request["method"] or ("id" in request and
+            (isinstance(rid, bool) or (rid is not None and type(rid) not in (str, int, float))))):
+        return rpc_error(None, -32600, "Invalid Request")
+    if type(rid) is float and not math.isfinite(rid):
+        return rpc_error(None, -32600, "Invalid Request")
+    if "params" in request and request["params"] is not None and not isinstance(request["params"], dict):
+        return rpc_error(rid, -32602, "Invalid params")
+    return None
+
+
+def _legacy_handle(request):
+    invalid = rpc_validate(request)
+    if invalid is not None:
+        return invalid
     method = request.get("method")
     if "id" not in request:  # notification: never answer
         return None
@@ -743,19 +938,61 @@ def handle(request):
     return rpc_error(mid, -32601, f"Method not found: {method}")
 
 
+def handle(request):
+    """MCP 2026-07-28 modern mode + backward-compatible legacy handshake."""
+    invalid = rpc_validate(request)
+    if invalid is not None:
+        return invalid
+    params = request.get("params") or {}
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    version = meta.get("io.modelcontextprotocol/protocolVersion") if isinstance(meta, dict) else None
+    method = request["method"]
+    if method == "server/discover" or version is not None:
+        if version != MODERN_PROTOCOL:
+            if method == "server/discover" and version is None:
+                return rpc_error(request.get("id"), -32601, "Method not found")
+            return rpc_error(request.get("id"), -32022, "Unsupported protocol version: " + MODERN_PROTOCOL)
+        if not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
+            return rpc_error(request.get("id"), -32602, "Missing clientCapabilities")
+        if "id" not in request:
+            return None
+        if method == "server/discover":
+            result = {"supportedVersions": [MODERN_PROTOCOL],
+                      "capabilities": {"tools": {}}}
+        elif method in ("initialize", "ping"):
+            return rpc_error(request.get("id"), -32601, "Method not supported in modern MCP")
+        else:
+            response = _legacy_handle(request)
+            if response is None or "result" not in response:
+                return response
+            result = response["result"]
+        result["_meta"] = {"io.modelcontextprotocol/serverInfo":
+                           {"name": SERVER_NAME, "version": SERVER_VERSION}}
+        return {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+    return _legacy_handle(request)
+
+
 def main():
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:  # noqa: BLE001
             pass
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
+    while True:
+        raw = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
+        if not raw:
+            break
+        if len(raw) > MAX_RPC_BYTES:
+            if not raw.endswith(b"\n"):
+                while raw and not raw.endswith(b"\n"):
+                    raw = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
+            send(rpc_error(None, -32600, "Request too large"))
+            continue
+        if not raw.strip():
             continue
         try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
+            request = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
             send(rpc_error(None, -32700, "Parse error"))
             continue
         try:
@@ -769,4 +1006,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 2 and sys.argv[1] == "--worker-loop":
+        worker_main()
+    else:
+        main()
