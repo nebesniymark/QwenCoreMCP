@@ -146,4 +146,12 @@ python -m pytest -q
 
 ---
 
-*Engineered with human vision and AI assistance.*
+---
+
+## Real-world integration testing
+
+QwenCoreMCP was exercised with **Qwen3.5-4B in LM Studio** across seven scenarios (math, finance, symbolic operations, matrices, time zones, persistent memory, and combined workflows).
+
+![QwenCoreMCP stress test overview](assets/qwencoremcp-supertest.svg)
+
+**Interpretation:** 163 tool calls comprised 148 valid results, 12 *expected* rejections of invalid requests (correct safety behavior), and 3 invalid model-generated requests corrected on retry. The audit also noted one unrequested memory write. **91/100** is an editorial assessment of the Qwen + MCP setup, and **97/100** of the modules; neither is a standardized statistical benchmark.
