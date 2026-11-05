@@ -9,8 +9,11 @@ from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 SERVER_NAME = "datetime-calendar"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+MODERN_PROTOCOL = "2026-07-28"
+MAX_RPC_BYTES = 65536
 
 _TZ_ALIASES = {
     "msk": "Europe/Moscow", "мск": "Europe/Moscow", "москва": "Europe/Moscow",
@@ -40,6 +43,8 @@ def get_zone(name):
     if not isinstance(name, str) or not name.strip() or len(name) > 100:
         raise ValueError("timezone must be a non-empty name such as Europe/Moscow, Moscow or UTC+3")
     raw = name.strip()
+    if raw.casefold() in ("utc", "z", "gmt"):
+        return timezone.utc, "UTC"
     m = _OFFSET_RE.fullmatch(raw)
     if m:
         hours, minutes = int(m.group(2)), int(m.group(3) or 0)
@@ -56,7 +61,7 @@ def get_zone(name):
             return ZoneInfo(candidate), candidate
         except (ZoneInfoNotFoundError, ValueError, OSError):
             continue
-    raise ValueError(f"Unknown timezone: {name}. Use an IANA name (Europe/Moscow), a city (Moscow) or an offset (UTC+3)")
+    raise ValueError(f"Unknown timezone: {name}. IANA zones on Windows may require 'pip install tzdata'; UTC needs no database")
 
 
 def parse_iso_datetime(value, field):
@@ -101,6 +106,50 @@ def run_tool(args):
             "weekday": current.strftime("%A"),
         }
 
+    if action == "convert":
+        dt = parse_iso_datetime(args.get("datetime"), "datetime")
+        tz, label = get_zone(args.get("timezone"))
+        converted = dt.astimezone(tz)
+        return {"input": dt.isoformat(), "timezone": label,
+                "result": converted.isoformat(), "fold": converted.fold,
+                "unix_timestamp": converted.timestamp()}
+
+    if action == "timestamp":
+        ts = args.get("timestamp")
+        if type(ts) not in (int, float) or not math.isfinite(ts):
+            raise ValueError("timestamp must be a finite number")
+        unit = args.get("timestamp_unit") or "seconds"
+        if unit not in ("seconds", "milliseconds"):
+            raise ValueError("timestamp_unit: seconds or milliseconds")
+        tz, label = get_zone(args.get("timezone") or "UTC")
+        try:
+            dt = datetime.fromtimestamp(ts / (1000 if unit == "milliseconds" else 1), timezone.utc).astimezone(tz)
+        except (OverflowError, ValueError, OSError):
+            raise ValueError("timestamp outside supported datetime range") from None
+        return {"timezone": label, "result": dt.isoformat(), "fold": dt.fold}
+
+    if action == "localize":
+        value = args.get("datetime")
+        if not isinstance(value, str) or len(value) > 100:
+            raise ValueError("datetime must be local ISO string without offset")
+        try:
+            local = datetime.fromisoformat(value)
+        except ValueError:
+            raise ValueError("Invalid local ISO datetime") from None
+        if local.tzinfo is not None:
+            raise ValueError("localize requires datetime without UTC offset")
+        tz, label = get_zone(args.get("timezone"))
+        fold = args.get("fold", 0)
+        if type(fold) is not int or fold not in (0, 1):
+            raise ValueError("fold must be 0 or 1")
+        candidate = local.replace(tzinfo=tz, fold=fold)
+        # Round-trip through UTC to detect imaginary local times.
+        roundtrip = candidate.astimezone(timezone.utc).astimezone(tz)
+        if roundtrip.replace(tzinfo=None) != local:
+            raise ValueError("Nonexistent local time during DST transition")
+        return {"timezone": label, "result": candidate.isoformat(),
+                "fold": candidate.fold, "unix_timestamp": candidate.timestamp()}
+
     if action == "calendar":
         year, month = args.get("year"), args.get("month")
         if type(year) is not int or not 1 <= year <= 9999:
@@ -119,7 +168,7 @@ def run_tool(args):
 
     if action == "weekday":
         value = args.get("date")
-        if not isinstance(value, str) or len(value) > 20:
+        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
             raise ValueError("date must use YYYY-MM-DD format")
         try:
             d = date.fromisoformat(value)
@@ -135,14 +184,32 @@ def run_tool(args):
             raise ValueError("unit must be seconds, minutes, hours, days, weeks, months, or years")
         if type(amount) not in (int, float) or not math.isfinite(amount) or abs(amount) > 1000000:
             raise ValueError("amount must be a finite number with absolute value <= 1000000")
-        if unit in {"months", "years"}:
-            if type(amount) is not int:
-                raise ValueError("amount must be an integer for months and years")
+        if unit in {"months", "years"} and type(amount) is not int:
+            raise ValueError("amount must be an integer for months and years")
+        zone_arg = args.get("timezone")
+        if zone_arg:
+            tz, _ = get_zone(zone_arg)
+            original = dt.astimezone(tz)
+            if unit in {"seconds", "minutes", "hours"}:
+                result = (dt.astimezone(timezone.utc) + timedelta(**{unit: amount})).astimezone(tz)
+            else:
+                naive = original.replace(tzinfo=None)
+                if unit in {"months", "years"}:
+                    naive = add_months(naive, amount if unit == "months" else amount * 12)
+                else:
+                    naive = naive + timedelta(**{unit: amount})
+                fold = args.get("fold", 0)
+                if type(fold) is not int or fold not in (0, 1):
+                    raise ValueError("fold must be 0 or 1")
+                result = naive.replace(tzinfo=tz, fold=fold)
+                check = result.astimezone(timezone.utc).astimezone(tz)
+                if check.replace(tzinfo=None) != naive:
+                    raise ValueError("Resulting local time does not exist due to DST")
+        elif unit in {"months", "years"}:
             result = add_months(dt, amount if unit == "months" else amount * 12)
         else:
-            kwargs = {unit: amount}
-            result = dt + timedelta(**kwargs)
-        return {"input": dt.isoformat(), "result": result.isoformat(timespec="seconds"), "unit": unit, "amount": amount}
+            result = dt + timedelta(**{unit: amount})
+        return {"input": dt.isoformat(), "result": result.isoformat(timespec="auto"), "unit": unit, "amount": amount}
 
     if action == "difference":
         start = parse_iso_datetime(args.get("start"), "start")
@@ -170,9 +237,25 @@ def rpc_error(mid, code, message):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
 
 
-def handle(req):
+def rpc_validate(req):
     if not isinstance(req, dict):
         return rpc_error(None, -32600, "Invalid Request")
+    rid = req.get("id")
+    if (req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str)
+            or not req["method"] or ("id" in req and
+            (isinstance(rid, bool) or (rid is not None and type(rid) not in (str, int, float))))):
+        return rpc_error(None, -32600, "Invalid Request")
+    if type(rid) is float and not math.isfinite(rid):
+        return rpc_error(None, -32600, "Invalid Request")
+    if "params" in req and req["params"] is not None and not isinstance(req["params"], dict):
+        return rpc_error(rid, -32602, "Invalid params")
+    return None
+
+
+def _legacy_handle(req):
+    invalid = rpc_validate(req)
+    if invalid is not None:
+        return invalid
     method = req.get("method")
     has_id = "id" in req
     mid = req.get("id")
@@ -183,7 +266,7 @@ def handle(req):
         return None
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": req.get("params", {}).get("protocolVersion") if req.get("params", {}).get("protocolVersion") in SUPPORTED_PROTOCOLS else PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }}
@@ -193,23 +276,26 @@ def handle(req):
         schema = {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["now", "calendar", "weekday", "add", "difference"]},
+                "action": {"type": "string", "enum": ["now", "calendar", "weekday", "add", "difference", "convert", "timestamp", "localize"]},
                 "timezone": {"type": "string", "description": "IANA name (Europe/Moscow), city (Moscow) or offset (UTC+3); default UTC; used by now"},
                 "year": {"type": "integer", "minimum": 1, "maximum": 9999},
                 "month": {"type": "integer", "minimum": 1, "maximum": 12},
                 "date": {"type": "string", "description": "Date in YYYY-MM-DD format; used by weekday"},
-                "datetime": {"type": "string", "description": "ISO 8601 datetime with UTC offset; used by add"},
+                "datetime": {"type": "string", "description": "ISO 8601: offset for add/convert, no offset for localize"},
                 "unit": {"type": "string", "enum": ["seconds", "minutes", "hours", "days", "weeks", "months", "years"]},
                 "amount": {"type": "number"},
                 "start": {"type": "string", "description": "ISO 8601 datetime with UTC offset; used by difference"},
-                "end": {"type": "string", "description": "ISO 8601 datetime with UTC offset; used by difference"},
+                "end": {"type": "string", "description": "ISO 8601 datetime with UTC offset; difference"},
+                "timestamp": {"type": "number", "description": "Unix timestamp input"},
+                "timestamp_unit": {"type": "string", "enum": ["seconds", "milliseconds"]},
+                "fold": {"type": "integer", "enum": [0, 1], "description": "localize: DST overlap choice"},
             },
             "required": ["action"],
             "additionalProperties": False,
         }
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [{
             "name": "datetime_calendar",
-            "description": "Date and time utility: current time in an IANA timezone, monthly calendar, weekday lookup, ISO datetime arithmetic, and difference between two instants. Datetimes for add/difference must include a UTC offset or Z.",
+            "description": "Dates: now(timezone?), calendar(year,month), weekday(date), add(datetime,unit,amount,timezone?), difference(start,end), convert(datetime,timezone), timestamp(timestamp,timestamp_unit?), localize(datetime,timezone,fold?). add/difference/convert use offset ISO; localize uses naive ISO. Months clamp; add with timezone follows DST.",
             "inputSchema": schema,
         }]}}
     if method == "tools/call":
@@ -225,18 +311,61 @@ def handle(req):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}}
 
 
+def handle(request):
+    """MCP 2026-07-28 modern mode + backward-compatible legacy handshake."""
+    invalid = rpc_validate(request)
+    if invalid is not None:
+        return invalid
+    params = request.get("params") or {}
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    version = meta.get("io.modelcontextprotocol/protocolVersion") if isinstance(meta, dict) else None
+    method = request["method"]
+    if method == "server/discover" or version is not None:
+        if version != MODERN_PROTOCOL:
+            if method == "server/discover" and version is None:
+                return rpc_error(request.get("id"), -32601, "Method not found")
+            return rpc_error(request.get("id"), -32022, "Unsupported protocol version: " + MODERN_PROTOCOL)
+        if not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
+            return rpc_error(request.get("id"), -32602, "Missing clientCapabilities")
+        if "id" not in request:
+            return None
+        if method == "server/discover":
+            result = {"supportedVersions": [MODERN_PROTOCOL],
+                      "capabilities": {"tools": {}}}
+        elif method in ("initialize", "ping"):
+            return rpc_error(request.get("id"), -32601, "Method not supported in modern MCP")
+        else:
+            response = _legacy_handle(request)
+            if response is None or "result" not in response:
+                return response
+            result = response["result"]
+        result["_meta"] = {"io.modelcontextprotocol/serverInfo":
+                           {"name": SERVER_NAME, "version": SERVER_VERSION}}
+        return {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
+    return _legacy_handle(request)
+
+
 def main():
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")   # Windows pipes default to cp125x
         except Exception:
             pass
-    for line in sys.stdin:
-        if not line.strip():
+    while True:
+        raw = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
+        if not raw:
+            break
+        if len(raw) > MAX_RPC_BYTES:
+            if not raw.endswith(b"\n"):
+                while raw and not raw.endswith(b"\n"):
+                    raw = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
+            send(rpc_error(None, -32600, "Request too large"))
+            continue
+        if not raw.strip():
             continue
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
+            req = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
             send(rpc_error(None, -32700, "Parse error"))
             continue
         try:
