@@ -1,0 +1,70 @@
+
+name: Bug Report
+description: Report a problem with a QwenCoreMCP engine.
+title: "[Bug]: "
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug!
+        Please check existing issues before submitting.
+        Never include passwords, API keys, tokens, or personal data.
+        Report security vulnerabilities privately via Security Advisories.
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Affected engine
+      options:
+        - MathEngine
+        - TimeEngine
+        - CompactMemoryEngine
+        - Multiple engines
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and MCP client.
+      placeholder: "Windows 11, Python 3.13, LM Studio"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the tool action and arguments if possible.
+      placeholder: |
+        1. Connect the engine.
+        2. Call the tool with...
+        3. Observe the error.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or additional context
+      description: Optional. Remove sensitive information.
+      render: text
+    validations:
+      required: false
