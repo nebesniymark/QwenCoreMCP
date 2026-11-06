@@ -9,7 +9,7 @@ from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 SERVER_NAME = "datetime-calendar"
-SERVER_VERSION = "1.2.1"
+SERVER_VERSION = "1.2.2"
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 MODERN_PROTOCOL = "2026-07-28"
@@ -243,7 +243,7 @@ def rpc_validate(req):
     rid = req.get("id")
     if (req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str)
             or not req["method"] or ("id" in req and
-            (isinstance(rid, bool) or (rid is not None and type(rid) not in (str, int, float))))):
+            (rid is None or isinstance(rid, bool) or type(rid) not in (str, int, float)))):
         return rpc_error(None, -32600, "Invalid Request")
     if type(rid) is float and not math.isfinite(rid):
         return rpc_error(None, -32600, "Invalid Request")
@@ -267,7 +267,7 @@ def _legacy_handle(req):
     if method == "initialize":
         params = req.get("params") or {}
         return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": params.get("protocolVersion") if params.get("protocolVersion") in SUPPORTED_PROTOCOLS else PROTOCOL_VERSION,
+            "protocolVersion": params.get("protocolVersion") if params.get("protocolVersion") in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }}
