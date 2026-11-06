@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Compact Memory 1.4.2: tiny zero-dependency MCP server for long-term memory
+Compact Memory 1.4.3: tiny zero-dependency MCP server for long-term memory
 of small local LLMs (4B, short context).
 
 Design goals: few actions/params, hard output budget, null-safe arguments,
@@ -24,7 +24,7 @@ from contextlib import contextmanager
 # CONFIG
 # ============================================================
 SERVER_NAME = "compact-memory"
-SERVER_VERSION = "1.4.2"
+SERVER_VERSION = "1.4.3"
 DEFAULT_PROTOCOL = "2024-11-05"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 MODERN_PROTOCOL = "2026-07-28"
@@ -56,7 +56,40 @@ SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9\-]{10,}"
     r"|(?<![^\W\d_])(?i:pass(?:word|wd)?|pwd|пароль|secret|api[_ \-]?key)\s*[:=\-—]\s*\S{4,}"
     r"|(?<![^\W\d_])(?i:token|токен)\s*[:=\-—]\s*(?=\S*\d)\S{6,}"
-    r"|[A-Fa-f0-9]{32,})"
+    r"|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_\-]{20,}"
+    r"|npm_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_\-]{35}"
+    r"|-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----"
+    # High-confidence credential tokens and authenticated URLs.
+    r"|(?<![A-Za-z0-9_])(?:sk_(?:live|test)_[A-Za-z0-9]{16,}|rk_(?:live|test)_[A-Za-z0-9]{16,})\b"
+    r"|(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{24,}\b"
+    r"|(?i:\bbearer[ \t]+[A-Za-z0-9._~+/-]{20,}={0,2})"
+    r"|(?i:\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:?#]+:[^\s/@?#]+@[^\s/?#]+)"
+    r"|(?i:\bmy[ \t]+password[ \t]+is[ \t]+(?!not\b)[^\s]{4,})"
+    r")"
+)
+HEX_RE = re.compile(r"(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])")
+SENSITIVE_KEY_RE = re.compile(
+    r"(?:^|_)(?:password|passwd|pwd|secret|token|api_?key|private_?key|"
+    r"client_?secret|access_?key|access_?token|refresh_?token|auth_?token|"
+    r"session_?token|bearer)(?:_|$)"
+)
+# Token counters/limits are LLM settings, not credentials. Keep this an exact
+# allowlist: access_token, refresh_token, token_limit_secret etc. stay protected.
+NON_SECRET_TOKEN_METADATA_KEYS = frozenset({
+    "token_limit", "token_budget", "token_count", "token_usage", "token_quota",
+    "tokens_per_second", "context_token_limit", "context_window_tokens",
+    "max_tokens", "max_input_tokens", "max_output_tokens", "max_completion_tokens",
+    "prompt_tokens", "completion_tokens", "input_tokens", "output_tokens",
+    "total_tokens", "used_tokens", "remaining_tokens",
+})
+IDENTIFIER_KEY_RE = re.compile(
+    r"^(?:git_?(?:sha|hash|commit|commit_sha|commit_hash)|"
+    r"github_?(?:sha|hash|commit)|commit_?(?:sha|hash)?|"
+    r"sha1|sha256|md5|uuid|guid|checksum|hash)$"
+)
+HEX_LABEL_RE = re.compile(
+    r"(?i)(?:\b(?:git(?:[ _-]+commit)?|commit(?:[ _-]+sha)?|sha1|"
+    r"sha256|md5|uuid|guid|checksum|hash)\b[ \t:=#-]*)$"
 )
 # Long base64-looking runs are only treated as secrets when they look random
 # (mixed case + digit, few slashes), so ordinary file paths are not blocked.
@@ -492,13 +525,22 @@ def _snapshot():
         log_debug(f"snapshot failed: {exc}")
 
 
+def _serialized_store(data):
+    """Use the exact UTF-8 representation written to disk for the size limit."""
+    serialized = json.dumps(data, ensure_ascii=False, indent=1, allow_nan=False)
+    if len(serialized.encode("utf-8")) > MAX_STORE_BYTES:
+        raise ValueError(f"memory would exceed safety limit ({MAX_STORE_BYTES} bytes); delete or shorten entries")
+    return serialized
+
+
 def _write_atomic(data):
+    serialized = _serialized_store(data)
     MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     _check_path(MEMORY_FILE)
     fd, tmp = tempfile.mkstemp(prefix=MEMORY_FILE.name + ".", suffix=".tmp", dir=MEMORY_FILE.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1, allow_nan=False)
+            f.write(serialized)
             f.flush()
             os.fsync(f.fileno())
         for attempt in range(5):
@@ -516,6 +558,8 @@ def _write_atomic(data):
 
 
 def save_memory(data):
+    # Reject oversize updates before touching the primary or its backups.
+    _serialized_store(data)
     if MEMORY_FILE.exists():
         _snapshot()
         # A failed main backup must prevent the new write; otherwise the next
@@ -531,17 +575,53 @@ def _looks_random(s: str) -> bool:
     return (any(c.isdigit() for c in s) and any(c.isupper() for c in s)
             and any(c.islower() for c in s) and s.count("/") < 3)
 
-def check_secret(text: str):
+def _field_name(name: str) -> str:
+    """Normalize both snake_case and camelCase profile field names."""
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    return re.sub(r"[^a-z0-9]+", "_", separated.casefold()).strip("_")
+
+
+def _safe_hex_identifier(text: str, match, key=None) -> bool:
+    """Allow only explicitly labeled SHA/UUID/checksum values, never bare hex secrets."""
+    token = match.group(0)
+    if len(token) not in (32, 40, 64):
+        return False
+    if key and IDENTIFIER_KEY_RE.fullmatch(_field_name(key)):
+        return text.strip() == token
+    return bool(HEX_LABEL_RE.search(text[max(0, match.start() - 40):match.start()]))
+
+
+def check_secret(text: str, *, key=None):
+    # Profile key and value form one semantic pair; inspect the field name first.
+    if key is not None:
+        normalized_key = _field_name(key)
+        # Metadata about a password manager is not the password itself.
+        descriptive_keys = {"password_manager", "password_policy", "password_requirements"}
+        if (normalized_key not in descriptive_keys
+                and normalized_key not in NON_SECRET_TOKEN_METADATA_KEYS
+                and SENSITIVE_KEY_RE.search(normalized_key)):
+            raise ValueError("looks like a secret/password/token; not saved")
     # These exact, complete phrases are safe descriptions, not credentials.
-    # Never delete a matching substring: that would let an appended secret pass.
+    # Never ignore a matching substring: that would let an appended secret pass.
     if re.fullmatch(r"(?i)(?:pass\s*[:=]\s*(?:true|false)|password\s*[-—]\s*manager(?:\s+bitwarden)?)", text.strip()):
         return
-    if SECRET_RE.search(text) or any(_looks_random(m.group(0)) for m in B64_RE.finditer(text)):
+    if SECRET_RE.search(text):
         raise ValueError("looks like a secret/password/token; not saved")
+    allowed_hex = []
+    for match in HEX_RE.finditer(text):
+        if not _safe_hex_identifier(text, match, key):
+            raise ValueError("looks like a secret/password/token; not saved")
+        allowed_hex.append((match.start(), match.end()))
+    for match in B64_RE.finditer(text):
+        # A tagged SHA/UUID can happen to look like random base64 too.
+        if any(start <= match.start() and match.end() <= end for start, end in allowed_hex):
+            continue
+        if _looks_random(match.group(0)):
+            raise ValueError("looks like a secret/password/token; not saved")
 
-def _redact(value):
+def _redact(value, *, key=None):
     try:
-        check_secret(value)
+        check_secret(value, key=key)
     except ValueError:
         return "[REDACTED: possible secret]"
     return value
@@ -562,7 +642,7 @@ def tool_read(a: dict, st: dict):
                 hidden += 1
                 continue
             prof[k] = v
-        out["profile"] = {k: _redact(v) for k, v in prof.items()}
+        out["profile"] = {k: _redact(v, key=k) for k, v in prof.items()}
 
     if cat in ("all", "note"):
         rows = []
@@ -608,7 +688,7 @@ def tool_save(a: dict, st: dict):
             raise ValueError('profile needs key and value. Example: {"action":"save","category":"profile","key":"os","value":"Windows 11"}')
         if len(v) > MAX_PROFILE_VALUE:
             raise ValueError(f"value too long (max {MAX_PROFILE_VALUE} chars); shorten it")
-        check_secret(v)
+        check_secret(v, key=key)
         if k not in st["profile"] and len(st["profile"]) >= MAX_PROFILE:
             raise ValueError("profile is full; delete unused keys first")
         old = st["profile"].get(k)
@@ -771,7 +851,7 @@ def rpc_validate(req):
     rid = req.get("id")
     if (req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str)
             or not req["method"] or ("id" in req and
-            (isinstance(rid, bool) or (rid is not None and type(rid) not in (str, int, float))))):
+            (rid is None or isinstance(rid, bool) or type(rid) not in (str, int, float)))):
         return rpc_error(None, -32600, "Invalid Request")
     if type(rid) is float and not math.isfinite(rid):
         return rpc_error(None, -32600, "Invalid Request")
@@ -792,7 +872,7 @@ def _legacy_handle_rpc(req):
     if method == "initialize":
         pv = params.get("protocolVersion")
         return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": pv if pv in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL,
+            "protocolVersion": pv if pv in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }}
