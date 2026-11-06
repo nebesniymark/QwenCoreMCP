@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP math server v3.1.2
+MCP math server v3.1.3
 
 Three evaluation backends, none of which uses eval()/exec() on user input:
   * numeric  - strict AST evaluator (ints/floats, math + finance functions)
@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover
     np = None
 
 SERVER_NAME = "math-calculator"
-SERVER_VERSION = "3.1.2"
+SERVER_VERSION = "3.1.3"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 MODERN_PROTOCOL = "2026-07-28"
@@ -47,6 +47,7 @@ MAX_MATRIX_AST_NODES = 2000  # matrix literals need more nodes than scalar expre
 MAX_INT_BITS = 4096
 MAX_EXPONENT = 500
 MAX_FACTORIAL_ARG = 536  # factorial(536) fits MAX_INT_BITS=4096
+MAX_ROUND_DIGITS = 1024  # cap costly huge negative ndigits in Python round()
 MAX_ARRAY_ELEMENTS = 10_000
 MAX_PERIODS = 12_000
 MAX_RESULT_CHARS = 3500
@@ -187,8 +188,17 @@ def safe_factorial(n):
     return math.factorial(n)
 
 
+def safe_round(number, ndigits=None):
+    """Bound decimal precision to avoid multi-second allocations in round()."""
+    if ndigits is None:
+        return round(number)
+    if type(ndigits) is not int or abs(ndigits) > MAX_ROUND_DIGITS:
+        raise ValueError(f"round ndigits must be an integer between -{MAX_ROUND_DIGITS} and {MAX_ROUND_DIGITS}")
+    return round(number, ndigits)
+
+
 NUMERIC_FUNCS = {
-    "abs": abs, "round": round, "min": min, "max": max,
+    "abs": abs, "round": safe_round, "min": min, "max": max,
     "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
     "asin": math.asin, "acos": math.acos, "atan": math.atan,
     "atan2": math.atan2, "log": math.log, "log2": math.log2,
@@ -701,7 +711,9 @@ def run_heavy(expr, mode, timeout=None):
                 env[key] = "1"
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             _worker_proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker-loop"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                # stderr goes to the parent process' stderr (never JSON-RPC stdout).
+                # This exposes worker crashes to LM Studio / caller logs without a log file.
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
                 text=True, encoding="utf-8", errors="replace", env=env, creationflags=flags,
                 bufsize=1)
         proc = _worker_proc
@@ -744,10 +756,20 @@ def worker_main():
     if os.name != "nt":
         try:
             import resource
-            resource.setrlimit(resource.RLIMIT_CPU, (120, 121))
-            resource.setrlimit(resource.RLIMIT_AS, (1536 * 1024**2, 1536 * 1024**2))
-        except (ImportError, OSError, ValueError):
-            pass
+        except ImportError:
+            resource = None
+        if resource is not None:
+            # Independent attempts: on some platforms RLIMIT_AS is unsupported.
+            for limit_name, bounds in (
+                ("RLIMIT_CPU", (120, 121)),
+                ("RLIMIT_AS", (1536 * 1024**2, 1536 * 1024**2)),
+            ):
+                limit_type = getattr(resource, limit_name, None)
+                if limit_type is not None:
+                    try:
+                        resource.setrlimit(limit_type, bounds)
+                    except (OSError, ValueError) as exc:
+                        sys.stderr.write(f"[math worker] {limit_name} unavailable: {exc}\n")
     for raw in sys.stdin:
         try:
             if len(raw) > MAX_EXPR_LEN + 150:
@@ -892,7 +914,7 @@ def rpc_validate(request):
     rid = request.get("id")
     if (request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str)
             or not request["method"] or ("id" in request and
-            (isinstance(rid, bool) or (rid is not None and type(rid) not in (str, int, float))))):
+            (rid is None or isinstance(rid, bool) or type(rid) not in (str, int, float)))):
         return rpc_error(None, -32600, "Invalid Request")
     if type(rid) is float and not math.isfinite(rid):
         return rpc_error(None, -32600, "Invalid Request")
@@ -915,7 +937,7 @@ def _legacy_handle(request):
     if method == "initialize":
         pv = params.get("protocolVersion")
         return {"jsonrpc": "2.0", "id": mid, "result": {
-            "protocolVersion": pv if pv in SUPPORTED_PROTOCOLS else DEFAULT_PROTOCOL,
+            "protocolVersion": pv if pv in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }}
