@@ -1,3 +1,21 @@
+# Python caches
 __pycache__/
 .pytest_cache/
 *.py[cod]
+.coverage
+htmlcov/
+
+# Virtual environments and local settings
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# User memory must never be committed
+.ai_memory.json*
+
+# Distribution artifacts
+build/
+dist/
+*.egg-info/
