@@ -127,11 +127,15 @@ The optional system prompts above are separate: copy **only the relevant block**
 
 ## 📦 Installation
 
-Requires Python 3.10+. Install dependencies:
+Requires Python 3.10+ and Git. Clone the repository and install dependencies:
 
 ```bash
+git clone https://github.com/nebesniymark/QwenCoreMCP.git
+cd QwenCoreMCP
 python -m pip install -r requirements.txt
 ```
+
+Configure your MCP client using the absolute script paths shown above.
 
 - **MathEngine:** NumPy for matrix operations and SymPy for symbolic mathematics.
 - **TimeEngine:** tzdata for IANA timezone support on Windows.
@@ -144,7 +148,22 @@ python -m pip install pytest jsonschema
 python -m pytest -q
 ```
 
----
+## 🔄 Updates
+
+From the cloned `QwenCoreMCP` directory:
+
+```bash
+git pull --ff-only
+python -m pip install -r requirements.txt
+```
+
+Restart your MCP client afterward. Updates are manual; `git pull` will not overwrite conflicting local edits.
+
+## 🐛 Bug Reports & Feedback
+
+Found a bug or have an idea? [Open a GitHub Issue](https://github.com/nebesniymark/QwenCoreMCP/issues) with your OS, Python version, affected engine, reproduction steps, and expected vs. actual behavior. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+
+For security vulnerabilities, follow [SECURITY.md](SECURITY.md) and report privately. Never post passwords, API keys, or personal data in public issues or logs.
 
 ---
 
