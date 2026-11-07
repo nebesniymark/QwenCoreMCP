@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """A small, safe JSON-RPC MCP server for date/time and calendar operations."""
+import calendar as _calendar
+import json
+import logging
+import math
 import re
 import sys
-import json
-import math
-import calendar as _calendar
-from datetime import datetime, date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
-SERVER_NAME = "datetime-calendar"
-SERVER_VERSION = "1.2.2"
+SERVER_NAME = "time-engine"
+SERVER_VERSION = "2.0.0"
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 MODERN_PROTOCOL = "2026-07-28"
@@ -21,7 +22,7 @@ _TZ_ALIASES = {
     "nyc": "America/New_York", "la": "America/Los_Angeles",
     "utc": "UTC", "gmt": "UTC", "z": "UTC",
 }
-_OFFSET_RE = re.compile(r"(?:utc|gmt)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", re.I)
+_OFFSET_RE = re.compile(r"(?:utc|gmt)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", re.IGNORECASE)
 _tz_index = None
 
 
@@ -198,7 +199,7 @@ def run_tool(args):
                     naive = add_months(naive, amount if unit == "months" else amount * 12)
                 else:
                     naive = naive + timedelta(**{unit: amount})
-                fold = args.get("fold", 0)
+                fold = args.get("fold", original.fold if amount == 0 else 0)
                 if type(fold) is not int or fold not in (0, 1):
                     raise ValueError("fold must be 0 or 1")
                 result = naive.replace(tzinfo=tz, fold=fold)
@@ -229,7 +230,11 @@ def run_tool(args):
 
 
 def send(message):
-    sys.stdout.write(json.dumps(message, ensure_ascii=False, allow_nan=False) + "\n")
+    try:
+        encoded = json.dumps(message, ensure_ascii=False, allow_nan=False)
+    except (ValueError, TypeError, RecursionError):
+        encoded = json.dumps(rpc_error(None, -32603, "Invalid response payload"))
+    sys.stdout.write(encoded + "\n")
     sys.stdout.flush()
 
 
@@ -243,9 +248,7 @@ def rpc_validate(req):
     rid = req.get("id")
     if (req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str)
             or not req["method"] or ("id" in req and
-            (rid is None or isinstance(rid, bool) or type(rid) not in (str, int, float)))):
-        return rpc_error(None, -32600, "Invalid Request")
-    if type(rid) is float and not math.isfinite(rid):
+            (rid is None or isinstance(rid, bool) or type(rid) not in (str, int)))):
         return rpc_error(None, -32600, "Invalid Request")
     if "params" in req and req["params"] is not None and not isinstance(req["params"], dict):
         return rpc_error(rid, -32602, "Invalid params")
@@ -253,6 +256,8 @@ def rpc_validate(req):
 
 
 def _legacy_handle(req):
+    if isinstance(req, dict) and "id" not in req:
+        return None  # JSON-RPC notification
     invalid = rpc_validate(req)
     if invalid is not None:
         return invalid
@@ -309,13 +314,15 @@ def _legacy_handle(req):
                 arguments = json.loads(arguments)
             result = run_tool({} if arguments is None else arguments)
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}], "isError": False}}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate failure at MCP/worker boundary
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "Datetime error: " + str(exc)}], "isError": True}}
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}}
 
 
 def handle(request):
     """MCP 2026-07-28 modern mode + backward-compatible legacy handshake."""
+    if isinstance(request, dict) and "id" not in request:
+        return None  # JSON-RPC notifications never receive replies.
     invalid = rpc_validate(request)
     if invalid is not None:
         return invalid
@@ -329,7 +336,7 @@ def handle(request):
                 return rpc_error(request.get("id"), -32601, "Method not found")
             return {"jsonrpc": "2.0", "id": request.get("id"), "error": {
                 "code": -32022, "message": "Unsupported protocol version",
-                "data": {"supported": [MODERN_PROTOCOL, *SUPPORTED_PROTOCOLS], "requested": version}}}
+                "data": {"supported": [MODERN_PROTOCOL, *SUPPORTED_PROTOCOLS], "requested": version if isinstance(version, str) else "[invalid version]"}}}
         if not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
             return rpc_error(request.get("id"), -32602, "Missing clientCapabilities")
         if "id" not in request:
@@ -358,8 +365,8 @@ def main():
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")   # Windows pipes default to cp125x
-        except Exception:
-            pass
+        except (OSError, ValueError, AttributeError) as exc:
+            logging.getLogger(__name__).debug("Unable to reconfigure standard stream: %s", exc)
     while True:
         raw = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
         if not raw:
@@ -374,12 +381,12 @@ def main():
             continue
         try:
             req = json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
             send(rpc_error(None, -32700, "Parse error"))
             continue
         try:
             response = handle(req)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate failure at MCP/worker boundary
             sys.stderr.write(f"[{SERVER_NAME}] internal error: {exc}\n")
             rid = req.get("id") if isinstance(req, dict) else None
             response = rpc_error(rid, -32603, "Internal error") if isinstance(req, dict) and "id" in req else None

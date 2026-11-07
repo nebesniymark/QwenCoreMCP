@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP math server v3.1.3
+MCP math server v3.2.0
 
 Three evaluation backends, none of which uses eval()/exec() on user input:
   * numeric  - strict AST evaluator (ints/floats, math + finance functions)
@@ -15,28 +15,38 @@ Finance convention: rates are DECIMAL PER PERIOD (0.01 = 1% per period).
 Use monthly(12) to turn "12% annual" into a monthly rate.
 """
 import ast
+import atexit
 import difflib
 import json
+import logging
 import math
 import operator
-import sys
 import os
 import subprocess
+import sys
 import threading
-import atexit
+from decimal import Decimal, localcontext
+from types import ModuleType
+
+sp: ModuleType | None = None
+np: ModuleType | None = None
 
 try:
-    import sympy as sp
+    import sympy as _sympy  # type: ignore[import-untyped]
 except ImportError:  # pragma: no cover
-    sp = None
+    pass
+else:
+    sp = _sympy
 
 try:
-    import numpy as np
+    import numpy as _numpy
 except ImportError:  # pragma: no cover
-    np = None
+    pass
+else:
+    np = _numpy
 
-SERVER_NAME = "math-calculator"
-SERVER_VERSION = "3.1.3"
+SERVER_NAME = "math-engine"
+SERVER_VERSION = "4.0.0"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = "2024-11-05"
 MODERN_PROTOCOL = "2026-07-28"
@@ -89,8 +99,11 @@ def pmt(rate, nper, pv):
     if r == 0:
         return pv / n
     x = -n * math.log1p(r)
-    if x > 700:  # limit: negative rates near -100% over many periods
-        return 0.0
+    if x > 700:  # expm1 would overflow; evaluate in log space instead.
+        if pv == 0:
+            return 0.0
+        magnitude = math.log(abs(pv)) + math.log(abs(r)) - x - math.log1p(-math.exp(-x))
+        return math.copysign(math.exp(magnitude), -pv * r)
     return pv * r / -math.expm1(x)
 
 
@@ -98,8 +111,9 @@ def fv(rate, nper, pmt_val, pv=0):
     r, n = check_rate(rate), check_nper(nper)
     if r == 0:
         return pv + pmt_val * n
-    growth = (1 + r) ** n
-    return pv * growth + pmt_val * (growth - 1) / r
+    exponent = n * math.log1p(r)
+    growth_minus_one = math.expm1(exponent)
+    return pv * (1 + growth_minus_one) + pmt_val * (growth_minus_one / r)
 
 
 def fv_growing_rent(invest_rate, nper, pmt_mortgage, rent_start, rent_growth_annual):
@@ -128,48 +142,134 @@ def npv(rate, *cashflows):
     return sum(cf / ((1 + r) ** i) for i, cf in enumerate(cashflows))
 
 
-def irr(*cashflows):
-    """Per-period internal rate of return (root closest to 0)."""
+def _poly_value(coefficients: tuple[float, ...], x: float) -> float:
+    """Evaluate a polynomial with bounded intermediates for positive ``x``.
+
+    Args:
+        coefficients: Ascending-order, normalized finite coefficients.
+        x: Positive finite evaluation point.
+
+    Returns:
+        Polynomial value, scaled by a positive power of ``x`` when x > 1.
+    """
+    if x <= 1.0:
+        value = 0.0
+        for coefficient in reversed(coefficients):
+            value = value * x + coefficient
+    else:
+        reciprocal = 1.0 / x
+        value = 0.0
+        for coefficient in coefficients:
+            value = value * reciprocal + coefficient
+    return value
+
+
+def _irr_polynomial_roots(coefficients: tuple[float, ...], low: float,
+                          high: float, *,
+                          verify_coefficients: tuple[float, ...] | None = None) -> list[float]:
+    """Isolate real polynomial roots using its derivative's critical points.
+
+    Args:
+        coefficients: Ascending coefficients, normalized to unit magnitude.
+        low: Positive lower bound for the discount factor.
+        high: Positive upper bound for the discount factor.
+        verify_coefficients: Original unscaled cashflows for verifying tangent roots.
+
+    Returns:
+        Distinct isolated roots within the bounds, including tangent roots.
+    """
+    while len(coefficients) > 1 and coefficients[-1] == 0:
+        coefficients = coefficients[:-1]
+    degree = len(coefficients) - 1
+    if degree <= 0:
+        return []
+    if degree == 1:
+        root = -coefficients[0] / coefficients[1]
+        return [root] if low <= root <= high else []
+
+    derivative = tuple(i * coefficient for i, coefficient in enumerate(coefficients) if i)
+    scale = max(abs(c) for c in derivative)
+    critical = _irr_polynomial_roots(tuple(c / scale for c in derivative), low, high)
+    points = [low, *critical, high]
+    values = [_poly_value(coefficients, x) for x in points]
+    roots: list[float] = []
+    # This is a numerical test for stationary (even-multiplicity) roots.
+    # Bracketed odd roots require a genuine sign change instead.
+    for i, (x, value) in enumerate(zip(points, values)):
+        if 0 < i < len(points) - 1 and abs(value) <= 1e-13:
+            if verify_coefficients is not None:
+                # A nearly-zero local extremum need not be a root. Evaluate
+                # against the original cashflows to avoid normalization noise.
+                with localcontext() as context:
+                    context.prec = 65
+                    point = Decimal(str(x))
+                    residual = Decimal(0)
+                    for coefficient in reversed(verify_coefficients):
+                        residual = residual * point + Decimal(str(coefficient))
+                    decimal_scale = max(abs(Decimal(str(c))) for c in verify_coefficients)
+                    if abs(residual) > decimal_scale * Decimal("1e-25"):
+                        continue
+            roots.append(x)
+    for i in range(len(points) - 1):
+        left, right = points[i], points[i + 1]
+        vleft, vright = values[i], values[i + 1]
+        if vleft == 0:
+            roots.append(left)
+        if vright == 0:
+            roots.append(right)
+        if (vleft < 0) == (vright < 0) or vleft == 0 or vright == 0:
+            continue
+        for _ in range(90):
+            mid = left + (right - left) / 2
+            if mid == left or mid == right:
+                break
+            value = _poly_value(coefficients, mid)
+            if value == 0:
+                left = right = mid
+                break
+            if (value < 0) == (vleft < 0):
+                left, vleft = mid, value
+            else:
+                right = mid
+        roots.append(left + (right - left) / 2)
+    return sorted(set(roots))
+
+
+def irr(*cashflows: float) -> float:
+    """Find the per-period IRR closest to zero in the range -99% to 1000%.
+
+    Uses polynomial critical-point isolation rather than a fixed sampling grid,
+    so nearby simple roots cannot both disappear between adjacent grid samples.
+    Cashflows are rescaled to avoid sensitivity to their absolute magnitude.
+
+    Args:
+        *cashflows: At least two finite real amounts with opposite signs.
+
+    Returns:
+        The real IRR within the supported range closest to zero.
+
+    Raises:
+        TypeError: A cashflow is not a real numeric scalar.
+        ValueError: Cashflows are invalid or no IRR is found in the range.
+    """
     if len(cashflows) < 2:
         raise ValueError("irr needs at least two cashflows")
-    if not (any(c < 0 for c in cashflows) and any(c > 0 for c in cashflows)):
+    if any(type(value) not in (int, float) for value in cashflows):
+        raise TypeError("irr cashflows must be real numbers")
+    if any(not math.isfinite(value) for value in cashflows):
+        raise ValueError("irr cashflows must be finite")
+    if not any(value < 0 for value in cashflows) or not any(value > 0 for value in cashflows):
         raise ValueError("irr needs at least one negative and one positive cashflow")
-
-    def f(r):
-        try:
-            return sum(cf / ((1 + r) ** i) for i, cf in enumerate(cashflows))
-        except ArithmeticError:
-            return None
-
-    grid = [-0.99 + 0.01 * k for k in range(200)] + [1.0 + 0.5 * k for k in range(19)]
-    roots = []
-    prev_r, prev_v = None, None
-    for r in grid:
-        v = f(r)
-        if v is None:
-            prev_r, prev_v = None, None
-            continue
-        if v == 0:
-            roots.append(r)
-        elif prev_v is not None and prev_v * v < 0:
-            lo, hi, flo = prev_r, r, prev_v
-            for _ in range(200):
-                mid = (lo + hi) / 2
-                fm = f(mid)
-                if fm is None:
-                    break
-                if fm == 0 or (hi - lo) < 1e-13:
-                    lo = hi = mid
-                    break
-                if flo * fm < 0:
-                    hi = mid
-                else:
-                    lo, flo = mid, fm
-            roots.append((lo + hi) / 2)
-        prev_r, prev_v = r, v
-    if not roots:
+    scale = max(abs(value) for value in cashflows)
+    coefficients = tuple(value / scale for value in cashflows)
+    # A normalized polynomial in x = 1/(1+r), with 0.01 <= 1+r <= 11.
+    roots = _irr_polynomial_roots(coefficients, 1.0 / 11.0, 100.0,
+                                  verify_coefficients=tuple(cashflows))
+    rates = [1.0 / root - 1.0 for root in roots if root > 0]
+    rates = [rate for rate in rates if -0.99 <= rate <= 10.0]
+    if not rates:
         raise ValueError("IRR not found in the range -99%..1000% per period")
-    return min(roots, key=abs)
+    return min(rates, key=abs)
 
 
 # ------------------------------ Numeric backend ------------------------------
@@ -338,7 +438,7 @@ def format_number(v):
 # ------------------------------ Symbolic backend -----------------------------
 
 SYM_VARS = ("x", "y", "z", "t")
-_SYM_CACHE = {}
+_SYM_CACHE: dict[str, dict[str, object]] = {}
 
 
 def sym_env():
@@ -553,6 +653,40 @@ def _dot_safe(a, b):
     return np.dot(a, b)
 
 
+def _solve_safe(a, b):
+    """Solve linear equations only after bounding NumPy's broadcast result.
+
+    Args:
+        a: Square coefficient matrix or a stack of square matrices.
+        b: Right-hand side vector or matrix, optionally batched.
+
+    Returns:
+        NumPy array of solutions.
+
+    Raises:
+        ValueError: If dimensions are invalid or the result exceeds the limit.
+    """
+    a, b = _arr(a), _arr(b)
+    if a.ndim < 2 or a.shape[-1] != a.shape[-2]:
+        raise ValueError("solve requires square coefficient matrices")
+    n = a.shape[-1]
+    if b.ndim < 1:
+        raise ValueError("solve requires a vector or matrix right-hand side")
+    # NumPy 2.x: b.ndim == 1 denotes a single vector, otherwise b is
+    # interpreted as a matrix and must have its penultimate axis equal to n.
+    if b.ndim == 1:
+        if b.shape[0] != n:
+            raise ValueError("solve dimensions do not align")
+        result_shape = a.shape[:-2] + (n,)
+    else:
+        if b.shape[-2] != n:
+            raise ValueError("solve dimensions do not align")
+        batch = np.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+        result_shape = batch + (n, b.shape[-1])
+    _limited_product(result_shape)
+    return np.linalg.solve(a, b)
+
+
 def mat_funcs():
     la = np.linalg
     return {
@@ -561,7 +695,7 @@ def mat_funcs():
         "inv": lambda x: la.inv(_arr(x)),
         "eigvals": lambda x: la.eigvals(_arr(x)),
         "norm": lambda x: la.norm(_arr(x)),
-        "solve": lambda a, b: la.solve(_arr(a), _arr(b)),
+        "solve": _solve_safe,
         "dot": _dot_safe,
         "matmul": _matmul_safe,
         "zeros": lambda s: np.zeros(_shape(s)),
@@ -673,13 +807,103 @@ def bounded_output(text, label="result"):
             f"{MAX_RESULT_CHARS} chars]\n" + text[:MAX_RESULT_CHARS])
 
 
+# Windows does not implement resource.setrlimit. Keep the job handle alive
+# throughout a worker's lifetime: closing it kills any remaining children.
+WINDOWS_WORKER_MEMORY_BYTES = 1536 * 1024**2
+_worker_job_handle = None
+
+
+def _attach_windows_job(proc):
+    """Apply a hard per-process RAM limit before sending any worker tasks.
+
+    A worker starts blocked on stdin; assignment happens before evaluation.
+    Fail closed if Windows cannot enforce the limit.
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IOCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimit),
+            ("IoInfo", IOCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    try:
+        limits = ExtendedLimit()
+        limits.BasicLimitInformation.LimitFlags = 0x100 | 0x2000  # PROCESS_MEMORY | KILL_ON_JOB_CLOSE
+        limits.ProcessMemoryLimit = WINDOWS_WORKER_MEMORY_BYTES
+        if not kernel32.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+        process_handle = kernel32.OpenProcess(0x0100 | 0x0001, False, proc.pid)  # SET_QUOTA | TERMINATE
+        if not process_handle:
+            raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+        try:
+            if not kernel32.AssignProcessToJobObject(handle, process_handle):
+                raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        finally:
+            kernel32.CloseHandle(process_handle)
+        return handle
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _close_windows_job(handle):
+    if handle is not None:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.CloseHandle(handle)
+
 _worker_proc = None
 _worker_jobs = 0
 _worker_lock = threading.Lock()
 
 
 def _stop_worker():
-    global _worker_proc, _worker_jobs
+    global _worker_proc, _worker_jobs, _worker_job_handle
+    job = _worker_job_handle
+    _worker_job_handle = None
     proc = _worker_proc
     _worker_proc = None
     _worker_jobs = 0
@@ -690,6 +914,7 @@ def _stop_worker():
             proc.communicate(timeout=1)
         except (OSError, subprocess.TimeoutExpired):
             pass
+    _close_windows_job(job)
 
 
 atexit.register(_stop_worker)
@@ -697,7 +922,7 @@ atexit.register(_stop_worker)
 
 def run_heavy(expr, mode, timeout=None):
     """One persistent isolated worker. Kill/restart after timeout or 128 calls."""
-    global _worker_proc, _worker_jobs
+    global _worker_proc, _worker_jobs, _worker_job_handle
     limit = HEAVY_TIMEOUT if timeout is None else timeout
     if mode not in ("symbolic", "matrix") or not isinstance(expr, str) or len(expr) > MAX_EXPR_LEN:
         raise ValueError("Invalid worker task")
@@ -716,13 +941,18 @@ def run_heavy(expr, mode, timeout=None):
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
                 text=True, encoding="utf-8", errors="replace", env=env, creationflags=flags,
                 bufsize=1)
+            try:
+                _worker_job_handle = _attach_windows_job(_worker_proc)
+            except (OSError, ValueError) as exc:
+                _stop_worker()
+                raise ValueError(f"Windows worker resource limits unavailable: {exc}") from exc
         proc = _worker_proc
         box = {}
 
         def read_result():
             try:
                 box["data"] = proc.stdout.readline()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate failure at MCP/worker boundary
                 box["error"] = exc
 
         try:
@@ -780,7 +1010,7 @@ def worker_main():
                 raise ValueError("Invalid worker task")
             val = symbolic_calculate(expr) if mode == "symbolic" else matrix_calculate(expr)
             result = {"ok": True, "value": val if val.startswith("[TRUNCATED ") else bounded_output(val)}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate failure at MCP/worker boundary
             result = {"ok": False, "error": str(exc)[:350]}
         sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
         sys.stdout.flush()
@@ -900,7 +1130,11 @@ TOOL_SCHEMA = {
 
 
 def send(payload):
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except (ValueError, TypeError, RecursionError):
+        encoded = json.dumps(rpc_error(None, -32603, "Invalid response payload"))
+    sys.stdout.write(encoded + "\n")
     sys.stdout.flush()
 
 
@@ -914,9 +1148,7 @@ def rpc_validate(request):
     rid = request.get("id")
     if (request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str)
             or not request["method"] or ("id" in request and
-            (rid is None or isinstance(rid, bool) or type(rid) not in (str, int, float)))):
-        return rpc_error(None, -32600, "Invalid Request")
-    if type(rid) is float and not math.isfinite(rid):
+            (rid is None or isinstance(rid, bool) or type(rid) not in (str, int)))):
         return rpc_error(None, -32600, "Invalid Request")
     if "params" in request and request["params"] is not None and not isinstance(request["params"], dict):
         return rpc_error(rid, -32602, "Invalid params")
@@ -924,6 +1156,8 @@ def rpc_validate(request):
 
 
 def _legacy_handle(request):
+    if isinstance(request, dict) and "id" not in request:
+        return None  # JSON-RPC notifications never receive replies.
     invalid = rpc_validate(request)
     if invalid is not None:
         return invalid
@@ -969,6 +1203,8 @@ def _legacy_handle(request):
 
 def handle(request):
     """MCP 2026-07-28 modern mode + backward-compatible legacy handshake."""
+    if isinstance(request, dict) and "id" not in request:
+        return None  # JSON-RPC notifications never receive replies.
     invalid = rpc_validate(request)
     if invalid is not None:
         return invalid
@@ -982,7 +1218,7 @@ def handle(request):
                 return rpc_error(request.get("id"), -32601, "Method not found")
             return {"jsonrpc": "2.0", "id": request.get("id"), "error": {
                 "code": -32022, "message": "Unsupported protocol version",
-                "data": {"supported": [MODERN_PROTOCOL, *SUPPORTED_PROTOCOLS], "requested": version}}}
+                "data": {"supported": [MODERN_PROTOCOL, *SUPPORTED_PROTOCOLS], "requested": version if isinstance(version, str) else "[invalid version]"}}}
         if not isinstance(meta.get("io.modelcontextprotocol/clientCapabilities"), dict):
             return rpc_error(request.get("id"), -32602, "Missing clientCapabilities")
         if "id" not in request:
@@ -1011,8 +1247,8 @@ def main():
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            pass
+        except (OSError, ValueError, AttributeError) as exc:
+            logging.getLogger(__name__).debug("Unable to reconfigure standard stream: %s", exc)
     while True:
         raw = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
         if not raw:
@@ -1027,7 +1263,7 @@ def main():
             continue
         try:
             request = json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
             send(rpc_error(None, -32700, "Parse error"))
             continue
         try:

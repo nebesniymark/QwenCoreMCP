@@ -1,0 +1,8 @@
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# MCP argument and persisted-data validation deliberately raises ValueError.
+# Converting these errors to TypeError would change the existing public contract
+# and the error classification exercised by the regression suite.
+ignore = ["TRY004"]

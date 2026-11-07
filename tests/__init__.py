@@ -1,0 +1,1 @@
+"""QwenCoreMCP automated test package."""

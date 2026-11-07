@@ -19,7 +19,7 @@ body:
       options:
         - MathEngine
         - TimeEngine
-        - CompactMemoryEngine
+        - MemoryEngine
         - Multiple engines
         - Not sure
     validations:
@@ -30,7 +30,7 @@ body:
     attributes:
       label: Environment
       description: OS, Python version, and MCP client.
-      placeholder: "Windows 11, Python 3.13, LM Studio"
+      placeholder: "OS, Python version, MCP client"
     validations:
       required: true
 
