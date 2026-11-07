@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
-"""A small, safe JSON-RPC MCP server for date/time and calendar operations."""
+"""TimeEngine — standalone MCP server for dates, timezones, and calendars.
+
+Actions:
+  now        Current date and time in a selected timezone (UTC by default).
+  calendar   Monday-first monthly calendar grid, including leap years.
+  weekday    Weekday number/name and weekend flag for an ISO date.
+  add        Date/time arithmetic from seconds through calendar years.
+  difference Elapsed time between two timezone-aware datetimes.
+  convert    Convert an instant to a different timezone.
+  localize   Interpret local wall-clock time and resolve DST overlaps with fold.
+  timestamp  Convert Unix seconds or milliseconds to a local datetime.
+
+Timezone support: IANA zones, unambiguous city names, aliases, UTC offsets.
+Datetime rules: add/difference/convert require ISO 8601 with an offset or Z;
+localize requires a local ISO datetime without an offset and rejects DST gaps.
+Calendar months clamp to the final valid day (Jan 31 + 1 month -> Feb 28/29).
+With an explicit timezone, add uses elapsed time for seconds/minutes/hours
+and wall-clock calendar time for days/weeks/months/years across DST changes.
+
+Standard-library only; IANA timezone data may require tzdata on Windows.
+"""
 import calendar as _calendar
 import json
 import logging
@@ -301,7 +321,16 @@ def _legacy_handle(req):
         }
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [{
             "name": "datetime_calendar",
-            "description": "Dates: now(timezone?), calendar(year,month), weekday(date), add(datetime,unit,amount,timezone?), difference(start,end), convert(datetime,timezone), timestamp(timestamp,timestamp_unit?), localize(datetime,timezone,fold?). add/difference/convert use offset ISO; localize uses naive ISO. Months clamp; add with timezone follows DST.",
+            "description": (
+                "Dates/time: now(timezone?), calendar(year,month; Monday first), weekday(date), "
+                "add(datetime,unit,amount,timezone?), difference(start,end), "
+                "convert(datetime,timezone), localize(datetime,timezone,fold?), "
+                "timestamp(timestamp,timestamp_unit?,timezone?). "
+                "Use ISO 8601 with UTC offset or Z for add/difference/convert; "
+                "localize requires an offset-free datetime. Months clamp to month-end. "
+                "With timezone, add uses elapsed time for seconds/minutes/hours "
+                "and local calendar time for days/weeks/months/years across DST."
+            ),
             "inputSchema": schema,
         }]}}
     if method == "tools/call":

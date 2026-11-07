@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""
-Compact Memory 1.5.0: tiny zero-dependency MCP server for long-term memory
-of small local LLMs (4B, short context).
+"""MemoryEngine — standalone MCP server for long-term memory.
 
-Design goals: few actions/params, hard output budget, null-safe arguments,
-safe storage (atomic write, backups, quarantine of corrupt files, file lock).
+Actions:
+  read    Search saved facts and notes, list recent entries, or read a full note by ID.
+  save    Create or update a profile fact (key/value) or note (text/project).
+  delete  Remove a profile fact by key or a note by ID.
+
+Memory categories: profile (persistent key/value facts) and note (text entries,
+optionally tagged with a project). Existing notes can be updated by ID.
+Read results are size-limited; requesting a note by ID returns its full text.
+Storage uses atomic writes, backups, file locking, and recovery of corrupt data.
+Potential credentials are rejected; output is redacted when necessary.
+
+Standard-library only. Local JSON storage; no external services required.
 """
 import json
 import logging

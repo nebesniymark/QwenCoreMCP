@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP math server v3.2.0
+MathEngine — standalone MCP server for safe mathematical calculations.
 
 Three evaluation backends, none of which uses eval()/exec() on user input:
   * numeric  - strict AST evaluator (ints/floats, math + finance functions)
