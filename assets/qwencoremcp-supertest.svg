@@ -23,24 +23,24 @@
   <rect fill="#4AE4C4" height="11" rx="6" ry="6" stroke="none" stroke-width="1" width="354.32" x="51" y="283"/>
   <text fill="#F4FAFF" font-size="17" font-weight="700" text-anchor="start" x="51" y="325">Strong integrated performance</text>
   <text fill="#AAC0D8" font-size="12.4" font-weight="500" text-anchor="start" x="51" y="347">Some workflows remain incomplete</text>
-  <rect fill="#282640" height="210" rx="18" ry="18" stroke="#635782" stroke-width="1" width="455" x="523" y="149"/>
+  <rect fill="#19364B" height="210" rx="18" ry="18" stroke="#42718B" stroke-width="1" width="455" x="523" y="149"/>
   <rect fill="#29465D" height="25" rx="13" ry="13" stroke="none" stroke-width="1" width="192" x="541" y="161"/>
   <text fill="#DCEEFF" font-size="12" font-weight="800" text-anchor="start" x="553" y="179">MODULE QUALITY</text>
-  <text fill="#B8A7FF" font-size="72" font-weight="800" text-anchor="start" x="543" y="246">95</text>
+  <text fill="#85C7FF" font-size="72" font-weight="800" text-anchor="start" x="543" y="246">95</text>
   <text fill="#EBF5FF" font-size="29" font-weight="600" text-anchor="start" x="678" y="242">/ 100</text>
   <text fill="#DCEAF5" font-size="14" font-weight="600" text-anchor="start" x="544" y="273">Math · Time · Memory</text>
   <rect fill="#293A52" height="11" rx="6" ry="6" stroke="none" stroke-width="1" width="412" x="544" y="283"/>
-  <rect fill="#B8A7FF" height="11" rx="6" ry="6" stroke="none" stroke-width="1" width="391.4" x="544" y="283"/>
+  <rect fill="#85C7FF" height="11" rx="6" ry="6" stroke="none" stroke-width="1" width="391.4" x="544" y="283"/>
   <text fill="#F4FAFF" font-size="17" font-weight="700" text-anchor="start" x="544" y="325">Core functions verified</text>
   <text fill="#AAC0D8" font-size="12.4" font-weight="500" text-anchor="start" x="544" y="347">No confirmed new engine defects</text>
-  <rect fill="#19364B" height="210" rx="18" ry="18" stroke="#42718B" stroke-width="1" width="455" x="1016" y="149"/>
+  <rect fill="#282640" height="210" rx="18" ry="18" stroke="#635782" stroke-width="1" width="455" x="1016" y="149"/>
   <rect fill="#29465D" height="25" rx="13" ry="13" stroke="none" stroke-width="1" width="192" x="1034" y="161"/>
   <text fill="#DCEEFF" font-size="12" font-weight="800" text-anchor="start" x="1046" y="179">MODEL RELIABILITY</text>
-  <text fill="#85C7FF" font-size="72" font-weight="800" text-anchor="start" x="1036" y="246">83</text>
+  <text fill="#B8A7FF" font-size="72" font-weight="800" text-anchor="start" x="1036" y="246">83</text>
   <text fill="#EBF5FF" font-size="29" font-weight="600" text-anchor="start" x="1171" y="242">/ 100</text>
   <text fill="#DCEAF5" font-size="14" font-weight="600" text-anchor="start" x="1037" y="273">Qwen3.5-4B tool usage</text>
   <rect fill="#293A52" height="11" rx="6" ry="6" stroke="none" stroke-width="1" width="412" x="1037" y="283"/>
-  <rect fill="#85C7FF" height="11" rx="6" ry="6" stroke="none" stroke-width="1" width="341.96" x="1037" y="283"/>
+  <rect fill="#B8A7FF" height="11" rx="6" ry="6" stroke="none" stroke-width="1" width="341.96" x="1037" y="283"/>
   <text fill="#F4FAFF" font-size="17" font-weight="700" text-anchor="start" x="1037" y="325">Good tool-use capability</text>
   <text fill="#AAC0D8" font-size="12.4" font-weight="500" text-anchor="start" x="1037" y="347">Model-side mistakes tracked separately</text>
   <rect x="30" y="379" width="348" height="98" rx="15" fill="#19283F" stroke="#38506B" stroke-width="1"/><rect x="48" y="395" width="4" height="30" rx="2" fill="#F3FAFF"/><text x="63" y="431" fill="#F3FAFF" font-size="52" font-weight="800">223</text><text x="48" y="454" fill="#F4FAFF" font-size="13.5" font-weight="800">TOTAL CALLS</text><text x="170" y="454" fill="#AAC0D8" font-size="11.5" font-weight="500">All tool requests</text><rect x="394" y="379" width="348" height="98" rx="15" fill="#19283F" stroke="#38506B" stroke-width="1"/><rect x="412" y="395" width="4" height="30" rx="2" fill="#4AE4C4"/><text x="427" y="431" fill="#4AE4C4" font-size="52" font-weight="800">176</text><text x="412" y="454" fill="#F4FAFF" font-size="13.5" font-weight="800">VALID</text><text x="534" y="454" fill="#AAC0D8" font-size="11.5" font-weight="500">Correct on first attempt</text><rect x="758" y="379" width="348" height="98" rx="15" fill="#19283F" stroke="#38506B" stroke-width="1"/><rect x="776" y="395" width="4" height="30" rx="2" fill="#85C7FF"/><text x="791" y="431" fill="#85C7FF" font-size="52" font-weight="800">19</text><text x="776" y="454" fill="#F4FAFF" font-size="13.5" font-weight="800">GUARDED</text><text x="898" y="454" fill="#AAC0D8" font-size="11.5" font-weight="500">Correctly rejected</text><rect x="1122" y="379" width="348" height="98" rx="15" fill="#19283F" stroke="#38506B" stroke-width="1"/><rect x="1140" y="395" width="4" height="30" rx="2" fill="#B9A7F4"/><text x="1155" y="431" fill="#B9A7F4" font-size="52" font-weight="800">28</text><text x="1140" y="454" fill="#F4FAFF" font-size="13.5" font-weight="800">DEVIATION</text><text x="1262" y="454" fill="#AAC0D8" font-size="11.5" font-weight="500">Model-side only</text><rect fill="#19283F" height="146" rx="17" ry="17" stroke="#38506B" stroke-width="1" width="1441" x="30" y="497"/>
